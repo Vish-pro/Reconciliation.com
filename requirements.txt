@@ -1,0 +1,13 @@
+streamlit>=1.35.0
+pdfplumber>=0.11.0
+rapidfuzz>=3.9.0
+pandas>=2.2.0
+openpyxl>=3.1.0
+python-dateutil>=2.9.0
+scipy>=1.13.0
+numpy>=1.26.0
+pikepdf>=9.0.0
+# OCR — optional, needed only for scanned PDFs
+pytesseract>=0.3.10
+pdf2image>=1.17.0
+Pillow>=10.0.0
