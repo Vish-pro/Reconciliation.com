@@ -1,16 +1,20 @@
 """
 reconciler.py — Bank Reconciliation Engine
 
-Features:
-  Extraction   : digital PDF, scanned PDF (OCR), CSV
-  PDF safety   : password unlock (pikepdf), junk-row filter, page crop,
-                 two-line narration merge, per-page column re-detection
-  Parsing      : 15 date formats + dateutil fallback, multi-currency,
-                 negatives / CR-suffix, Indian lakh format, unicode NFKC
-  Matching     : bipartite 1:1 (Hungarian), 1:N splits, N:1 consolidations,
-                 reversal detection, amount-bucket index for O(1) candidates
-  Helpers      : peek_pdf_rows(), detect_format(), is_scanned_pdf(),
-                 is_tally_pdf() — used by the Streamlit UI
+Regions: India (IN) · USA (US) · Australia (AU)
+
+Banks  : HDFC/SBI/Axis/ICICI/Kotak (IN)
+         Chase/WellsFargo/BofA/Citi/CapitalOne/USBank (US)
+         ANZ/NAB/Westpac/CBA/Macquarie (AU)
+
+Books  : Tally CSV/PDF (IN)
+         QuickBooks CSV/IIF, Xero CSV, Wave CSV, FreshBooks CSV, OFX/QBO (US)
+         Xero CSV, MYOB CSV, QuickBooks AU CSV, QIF, OFX (AU)
+
+Formats: digital PDF, scanned PDF (OCR), CSV, OFX/QBO/QFX, QIF, IIF
+
+Matching: bipartite 1:1 (Hungarian), 1:N splits, N:1 consolidations,
+          reversal detection, amount-bucket index
 """
 
 from __future__ import annotations
@@ -31,7 +35,6 @@ from dateutil import parser as dateparser
 from rapidfuzz import fuzz
 from scipy.optimize import linear_sum_assignment
 
-# ── Optional deps — graceful fallback ────────────────────────────────────────
 try:
     import pikepdf
     HAS_PIKEPDF = True
@@ -42,7 +45,7 @@ try:
     import pytesseract
     from pytesseract import Output as TessOutput
     from pdf2image import convert_from_bytes
-    from PIL import Image          # noqa: F401 — confirms Pillow present
+    from PIL import Image          # noqa: F401
     HAS_OCR = True
 except ImportError:
     HAS_OCR = False
@@ -54,15 +57,47 @@ warnings.filterwarnings("ignore")
 # CONFIG
 # ═══════════════════════════════════════════════════════════════════
 
-BANK_FORMATS: dict[str, Optional[dict]] = {
-    "Auto-Detect": None,
-    "HDFC":   {"date": 0, "narration": 1, "debit": 4, "credit": 5},
-    "SBI":    {"date": 0, "narration": 2, "debit": 4, "credit": 5},
-    "Axis":   {"date": 0, "narration": 2, "debit": 3, "credit": 4},
-    "ICICI":  {"date": 0, "narration": 1, "debit": 3, "credit": 4},
-    "Kotak":  {"date": 0, "narration": 1, "debit": 3, "credit": 4},
-    "Custom": None,   # filled by UI column mapper
+BANK_FORMATS: dict[str, dict[str, Optional[dict]]] = {
+    "IN": {
+        "Auto-Detect": None,
+        "HDFC":        {"date": 0, "narration": 1, "debit": 4, "credit": 5},
+        "SBI":         {"date": 0, "narration": 2, "debit": 4, "credit": 5},
+        "Axis":        {"date": 0, "narration": 2, "debit": 3, "credit": 4},
+        "ICICI":       {"date": 0, "narration": 1, "debit": 3, "credit": 4},
+        "Kotak":       {"date": 0, "narration": 1, "debit": 3, "credit": 4},
+        "Custom":      None,
+    },
+    "US": {
+        "Auto-Detect":     None,
+        "Chase":           {"date": 0, "narration": 1, "amount": 2},
+        "Wells Fargo":     {"date": 0, "narration": 3, "amount": 5, "no_header": True},
+        "Bank of America": {"date": 0, "narration": 1, "amount": 2},
+        "Citi":            {"date": 1, "narration": 2, "debit": 3, "credit": 4},
+        "Capital One":     {"date": 0, "narration": 3, "debit": 5, "credit": 6},
+        "US Bank":         {"date": 0, "narration": 2, "amount": 4},
+        "Custom":          None,
+    },
+    "AU": {
+        "Auto-Detect":    None,
+        "ANZ":            {"date": 0, "narration": 1, "amount": 2},
+        "NAB":            {"date": 0, "narration": 1, "debit": 2, "credit": 3},
+        "Westpac":        {"date": 0, "narration": 7, "amount": 5, "date_fmt": "YYYYMMDD"},
+        "CBA (OCR only)": None,
+        "Macquarie":      {"date": 0, "narration": 1, "amount": 2},
+        "Custom":         None,
+    },
 }
+
+BOOKS_SOFTWARE: dict[str, list[str]] = {
+    "IN": ["Tally CSV", "Tally PDF", "Generic CSV"],
+    "US": ["QuickBooks CSV", "QuickBooks IIF", "Xero CSV",
+           "Wave CSV", "FreshBooks CSV", "OFX / QBO", "Generic CSV"],
+    "AU": ["Xero CSV", "MYOB CSV", "QuickBooks AU CSV",
+           "QIF", "OFX", "Generic CSV"],
+}
+
+_REGION_CURRENCY: dict[str, str] = {"IN": "INR", "US": "USD", "AU": "AUD"}
+_REGION_CURRENCY_SYMBOL: dict[str, str] = {"IN": "₹", "US": "$", "AU": "A$"}
 
 _JUNK_PATTERNS = [
     r"opening\s*balance", r"closing\s*balance", r"balance\s*b/?f",
@@ -72,30 +107,61 @@ _JUNK_PATTERNS = [
     r"terms\s+and\s+conditions", r"this\s+is\s+(a\s+)?computer",
 ]
 
-_CURRENCY_SYMBOLS = {
-    "₹": "INR", "Rs.": "INR", "Rs": "INR", "INR": "INR",
-    "USD": "USD", "$": "USD",
-    "EUR": "EUR", "€": "EUR",
-    "GBP": "GBP", "£": "GBP",
+# Longest symbols first so "A$" is matched before "$"
+_CURRENCY_SYMBOLS: dict[str, str] = {
+    "Rs.": "INR", "INR": "INR", "Rs": "INR", "₹": "INR",
+    "AU$": "AUD", "AUD": "AUD", "A$": "AUD",
+    "US$": "USD", "USD": "USD",
+    "CAD": "CAD", "C$":  "CAD",
+    "NZD": "NZD", "NZ$": "NZD",
+    "SGD": "SGD", "S$":  "SGD",
+    "EUR": "EUR", "€":   "EUR",
+    "GBP": "GBP", "£":   "GBP",
+    # plain "$" handled separately (region-aware)
 }
 
-_DATE_FORMATS = [
+_DATE_FORMATS_US = [
+    "%m/%d/%Y", "%m-%d-%Y", "%m/%d/%y", "%m-%d-%y",
+    "%d/%m/%Y", "%d-%m-%Y", "%d/%m/%y", "%d-%m-%y",
+    "%d %b %Y", "%d-%b-%Y", "%d/%b/%Y", "%d %b %y",
+    "%d %B %Y", "%d-%B-%Y",
+    "%Y-%m-%d", "%d.%m.%Y", "%d.%m.%y",
+    "%b %d, %Y", "%B %d, %Y",
+]
+_DATE_FORMATS_IN_AU = [
     "%d/%m/%Y", "%d-%m-%Y", "%d/%m/%y", "%d-%m-%y",
     "%d %b %Y", "%d-%b-%Y", "%d/%b/%Y", "%d %b %y",
     "%d %B %Y", "%d-%B-%Y",
     "%Y-%m-%d", "%m/%d/%Y", "%m-%d-%Y",
     "%d.%m.%Y", "%d.%m.%y",
 ]
+_DATE_FORMATS_BY_REGION: dict[str, list[str]] = {
+    "US": _DATE_FORMATS_US,
+    "IN": _DATE_FORMATS_IN_AU,
+    "AU": _DATE_FORMATS_IN_AU,
+}
 
 _HEADER_KEYWORDS: dict[str, set[str]] = {
-    "date":      {"date", "dt", "txn date", "tran date", "trans date",
-                  "value date", "posting date"},
-    "narration": {"narration", "description", "particulars", "remarks",
-                  "details", "desc", "transaction details"},
-    "debit":     {"debit", "dr", "withdrawal", "withdraw",
-                  "paid out", "debit amt", "withdrawal amt"},
-    "credit":    {"credit", "cr", "deposit", "received",
-                  "credit amt", "deposit amt"},
+    "date": {
+        "date", "dt", "txn date", "tran date", "trans date",
+        "value date", "posting date", "transaction date",
+        "posted date", "tran_date",
+    },
+    "narration": {
+        "narration", "description", "particulars", "remarks",
+        "details", "desc", "transaction details", "narrative",
+        "memo", "name", "payee", "merchant",
+    },
+    "debit": {
+        "debit", "dr", "withdrawal", "withdraw",
+        "paid out", "debit amt", "withdrawal amt",
+        "money out", "outgoing",
+    },
+    "credit": {
+        "credit", "cr", "deposit", "received",
+        "credit amt", "deposit amt", "money in", "incoming",
+    },
+    "amount": {"amount", "amt", "trnamt"},
 }
 
 _TALLY_KEYWORDS = {"tally", "tallyprime", "tally.erp", "tdl", "tally solutions"}
@@ -110,8 +176,8 @@ class Transaction:
     date: str
     amount: float
     narration: str
-    txn_type: str          # "debit" | "credit"
-    source: str            # "bank" | "books"
+    txn_type: str           # "debit" | "credit"
+    source: str             # "bank" | "books"
     currency: str = "INR"
     is_reversal: bool = False
     raw: dict = field(default_factory=dict, repr=False)
@@ -119,7 +185,7 @@ class Transaction:
 
 @dataclass
 class MatchResult:
-    match_type: str        # "1:1" | "1:N" | "N:1" | "reversal"
+    match_type: str         # "1:1" | "1:N" | "N:1" | "reversal"
     bank: list[Transaction]
     books: list[Transaction]
     score: float
@@ -155,21 +221,28 @@ def _is_junk_row(row: list) -> bool:
 # AMOUNT PARSING
 # ═══════════════════════════════════════════════════════════════════
 
-def _parse_amount(val: str) -> tuple[Optional[float], str, bool]:
+def _parse_amount(val: str, region: str = "IN") -> tuple[Optional[float], str, bool]:
     """
     Returns (amount, currency, is_reversal).
-    Handles: ₹1,000.00 | 1000 CR | -500 | (500.00) | USD 100 | 1,00,000
+    Handles: ₹1,000 | $100 | A$50 | -500 | 500 CR | (500.00) | 1,00,000
+    Plain "$" is resolved by region: US→USD, AU→AUD.
     """
     if not val:
-        return None, "INR", False
+        return None, _REGION_CURRENCY.get(region, "INR"), False
     s = _clean_text(str(val))
+    currency = _REGION_CURRENCY.get(region, "INR")
 
-    currency = "INR"
-    for symbol, code in _CURRENCY_SYMBOLS.items():
+    # Check multi-char symbols longest-first
+    for symbol in sorted(_CURRENCY_SYMBOLS, key=len, reverse=True):
         if symbol in s:
-            currency = code
-            s = s.replace(symbol, "").strip()
+            currency = _CURRENCY_SYMBOLS[symbol]
+            s = s.replace(symbol, "", 1).strip()
             break
+    else:
+        # Plain "$" — region-aware
+        if "$" in s:
+            currency = "USD" if region == "US" else "AUD" if region == "AU" else "USD"
+            s = s.replace("$", "").strip()
 
     is_reversal = bool(re.search(
         r"\bCR\b|\bReversal\b|\bRev\b|\bReturn\b", s, re.IGNORECASE
@@ -194,17 +267,25 @@ def _parse_amount(val: str) -> tuple[Optional[float], str, bool]:
 # DATE PARSING
 # ═══════════════════════════════════════════════════════════════════
 
-def _parse_date(val: str) -> Optional[str]:
+def _parse_date(val: str, region: str = "IN") -> Optional[str]:
     val = _clean_text(str(val or "")).strip()
     if not val or len(val) < 4:
         return None
-    for fmt in _DATE_FORMATS:
+    # Westpac YYYYMMDD — 8 pure digits
+    if re.match(r"^\d{8}$", val):
+        try:
+            return datetime.strptime(val, "%Y%m%d").strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+    formats = _DATE_FORMATS_BY_REGION.get(region, _DATE_FORMATS_IN_AU)
+    for fmt in formats:
         try:
             return datetime.strptime(val, fmt).strftime("%Y-%m-%d")
         except ValueError:
             continue
     try:
-        return dateparser.parse(val, dayfirst=True).strftime("%Y-%m-%d")
+        dayfirst = region != "US"
+        return dateparser.parse(val, dayfirst=dayfirst).strftime("%Y-%m-%d")
     except Exception:
         return None
 
@@ -251,7 +332,9 @@ def _detect_columns(header_row: list) -> Optional[dict]:
         for col_type, keywords in _HEADER_KEYWORDS.items():
             if col_type not in mapping and any(kw in cell_norm for kw in keywords):
                 mapping[col_type] = i
-    if "date" in mapping and ("debit" in mapping or "credit" in mapping):
+    has_amount = "amount" in mapping
+    has_split  = "debit" in mapping or "credit" in mapping
+    if "date" in mapping and (has_amount or has_split):
         mapping.setdefault("narration", 1)
         return mapping
     return None
@@ -266,9 +349,76 @@ def _find_header(rows: list[list]) -> tuple[int, Optional[dict]]:
 
 
 def detect_format(rows: list[list]) -> Optional[dict]:
-    """Public wrapper — used by the UI column mapper to check auto-detect."""
     _, col_map = _find_header(rows)
     return col_map
+
+
+# ═══════════════════════════════════════════════════════════════════
+# SHARED ROW PARSER
+# ═══════════════════════════════════════════════════════════════════
+
+def _parse_data_row(
+    row: list,
+    col_map: dict,
+    source: str,
+    base_currency: str,
+    region: str,
+) -> list[Transaction]:
+    """Convert one raw table/CSV row → 0, 1, or 2 Transaction objects."""
+    date_col = col_map.get("date", 0)
+    narr_col = col_map.get("narration", 1)
+
+    parsed_date = _parse_date(
+        str(row[date_col] if date_col < len(row) else ""), region
+    )
+    if not parsed_date:
+        return []
+
+    narration = _clean_text(str(row[narr_col] if narr_col < len(row) else ""))
+    result: list[Transaction] = []
+
+    if "amount" in col_map:
+        amt_col = col_map["amount"]
+        raw_val = str(row[amt_col] if amt_col < len(row) else "")
+        amount, currency, is_reversal = _parse_amount(raw_val, region)
+        if amount is None:
+            return []
+        if amount < 0:
+            txn_type = "debit"
+            amount = abs(amount)
+            is_reversal = True
+        else:
+            txn_type = "credit"
+        note = f"[{currency}] {narration}" if currency != base_currency else narration
+        result.append(Transaction(
+            date=parsed_date, amount=round(amount, 2),
+            narration=note, txn_type=txn_type,
+            source=source, currency=currency, is_reversal=is_reversal,
+        ))
+    else:
+        debit_col  = col_map.get("debit", 2)
+        credit_col = col_map.get("credit", 3)
+        for raw_val, base_type in (
+            (row[debit_col]  if debit_col  < len(row) else "", "debit"),
+            (row[credit_col] if credit_col < len(row) else "", "credit"),
+        ):
+            amount, currency, is_reversal = _parse_amount(str(raw_val or ""), region)
+            if amount is None:
+                continue
+            txn_type = base_type
+            if amount < 0:
+                txn_type    = "credit" if base_type == "debit" else "debit"
+                amount      = abs(amount)
+                is_reversal = True
+            note = f"[{currency}] {narration}" if currency != base_currency else narration
+            result.append(Transaction(
+                date=parsed_date, amount=round(amount, 2),
+                narration=note, txn_type=txn_type,
+                source=source, currency=currency, is_reversal=is_reversal,
+                raw={"row": row},
+            ))
+
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -301,11 +451,6 @@ def _merge_wrapped_rows(rows: list[list], date_col: int) -> list[list]:
 # ═══════════════════════════════════════════════════════════════════
 
 def is_scanned_pdf(file) -> bool:
-    """
-    Returns True if PDF has no extractable text — i.e., it is image-based / scanned.
-    Checks first 3 pages; if any yields >50 chars of text, it's digital.
-    Leaves file pointer at position 0 after the check.
-    """
     raw = file.read() if hasattr(file, "read") else file
     buf = io.BytesIO(raw)
     try:
@@ -324,23 +469,13 @@ def is_scanned_pdf(file) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# OCR PIPELINE  (pytesseract + pdf2image)
+# OCR PIPELINE
 # ═══════════════════════════════════════════════════════════════════
 
 def _ocr_image_to_rows(img, gap_frac: float = 0.025) -> list[list[str]]:
-    """
-    Convert one PIL image to a list of cell-rows using pytesseract bounding boxes.
-
-    Strategy:
-      1. Get word-level bounding boxes (image_to_data).
-      2. Cluster words into rows by vertical proximity (y_tol = 1 % of page height).
-      3. Within each row, split words into cells by horizontal gap
-         (gap_frac × page_width).
-    This handles multi-column bank statement layouts without needing OpenCV.
-    """
     data = pytesseract.image_to_data(
         img, output_type=TessOutput.DATAFRAME,
-        config="--psm 6 --oem 3",   # uniform block, LSTM engine
+        config="--psm 6 --oem 3",
     )
     data = data[(data["conf"] > 30) & (data["text"].str.strip() != "")]
     if data.empty:
@@ -348,12 +483,11 @@ def _ocr_image_to_rows(img, gap_frac: float = 0.025) -> list[list[str]]:
 
     y_tol     = img.height * 0.012
     x_gap_min = img.width  * gap_frac
-    data = data.sort_values(["top", "left"]).reset_index(drop=True)
+    data      = data.sort_values(["top", "left"]).reset_index(drop=True)
 
-    # ── Cluster into rows ────────────────────────────────────────
     row_groups: list[list[dict]] = []
     current: list[dict] = [data.iloc[0].to_dict()]
-    current_y: float = data.iloc[0]["top"]
+    current_y: float    = data.iloc[0]["top"]
 
     for _, word in data.iloc[1:].iterrows():
         if abs(word["top"] - current_y) <= y_tol:
@@ -365,15 +499,13 @@ def _ocr_image_to_rows(img, gap_frac: float = 0.025) -> list[list[str]]:
     if current:
         row_groups.append(sorted(current, key=lambda w: w["left"]))
 
-    # ── Merge words into cells by x-gap ─────────────────────────
     result: list[list[str]] = []
     for group in row_groups:
         if not group:
             continue
-        cells: list[str] = []
+        cells: list[str]      = []
         cell_words: list[str] = [group[0]["text"]]
-        prev_right: float = group[0]["left"] + group[0]["width"]
-
+        prev_right: float     = group[0]["left"] + group[0]["width"]
         for word in group[1:]:
             gap = word["left"] - prev_right
             if gap > x_gap_min:
@@ -382,7 +514,6 @@ def _ocr_image_to_rows(img, gap_frac: float = 0.025) -> list[list[str]]:
             else:
                 cell_words.append(word["text"])
             prev_right = word["left"] + word["width"]
-
         cells.append(" ".join(cell_words).strip())
         result.append([c for c in cells if c])
 
@@ -395,74 +526,35 @@ def extract_with_ocr(
     source: str,
     password: str = "",
     base_currency: str = "INR",
+    region: str = "IN",
     dpi: int = 300,
 ) -> list[Transaction]:
-    """
-    OCR extraction pipeline for scanned / image-based PDFs.
-
-    Flow: PDF → unlock → pdf2image (PIL images) → tesseract bounding boxes
-          → cell rows → same parsing pipeline as digital PDFs.
-
-    Requires: pytesseract, pdf2image, Pillow, tesseract binary.
-    On Ubuntu/Streamlit Cloud: add tesseract-ocr + poppler-utils to packages.txt.
-    """
     if not HAS_OCR:
         raise RuntimeError(
             "OCR not available. Install: pip install pytesseract pdf2image pillow\n"
             "Also install Tesseract binary (see README)."
         )
-
     unlocked = unlock_pdf(file, password)
     images   = convert_from_bytes(unlocked.read(), dpi=dpi)
-
     all_rows: list[list[str]] = []
     for img in images:
         all_rows.extend(_ocr_image_to_rows(img))
-
     if not all_rows:
         return []
 
-    # Re-use the same downstream parsing pipeline
     header_idx, auto_map = _find_header(all_rows)
-    col_map    = fmt_config or auto_map or {"date": 0, "narration": 1, "debit": 2, "credit": 3}
-    date_col   = col_map.get("date", 0)
-    narr_col   = col_map.get("narration", 1)
-    debit_col  = col_map.get("debit", 2)
-    credit_col = col_map.get("credit", 3)
-
+    col_map   = fmt_config or auto_map or {"date": 0, "narration": 1, "debit": 2, "credit": 3}
+    date_col  = col_map.get("date", 0)
     data_rows = _merge_wrapped_rows(all_rows[header_idx + 1:], date_col)
-    transactions: list[Transaction] = []
 
+    transactions: list[Transaction] = []
     for row in data_rows:
         if _is_junk_row(row):
             continue
         try:
-            parsed_date = _parse_date(str(row[date_col] if date_col < len(row) else ""))
-            if not parsed_date:
-                continue
-            narration = _clean_text(str(row[narr_col] if narr_col < len(row) else ""))
-
-            for raw_val, base_type in (
-                (row[debit_col]  if debit_col  < len(row) else "", "debit"),
-                (row[credit_col] if credit_col < len(row) else "", "credit"),
-            ):
-                amount, currency, is_reversal = _parse_amount(str(raw_val or ""))
-                if amount is None:
-                    continue
-                txn_type = base_type
-                if amount < 0:
-                    txn_type    = "credit" if base_type == "debit" else "debit"
-                    amount      = abs(amount)
-                    is_reversal = True
-                note = f"[{currency}] {narration}" if currency != base_currency else narration
-                transactions.append(Transaction(
-                    date=parsed_date, amount=round(amount, 2),
-                    narration=note, txn_type=txn_type,
-                    source=source, currency=currency, is_reversal=is_reversal,
-                ))
+            transactions.extend(_parse_data_row(row, col_map, source, base_currency, region))
         except (IndexError, AttributeError):
             continue
-
     return transactions
 
 
@@ -471,15 +563,9 @@ def extract_with_ocr(
 # ═══════════════════════════════════════════════════════════════════
 
 def peek_pdf_rows(file, max_rows: int = 15) -> list[list[str]]:
-    """
-    Extract raw table rows from the first 3 pages of a PDF — no parsing.
-    Used by the column mapper UI to display a preview so the user can
-    visually identify which column index = Date / Narration / Debit / Credit.
-    """
     raw = file.read() if hasattr(file, "read") else file
     buf = io.BytesIO(raw)
     rows: list[list[str]] = []
-
     try:
         with pdfplumber.open(buf) as pdf:
             for page in pdf.pages[:3]:
@@ -491,21 +577,14 @@ def peek_pdf_rows(file, max_rows: int = 15) -> list[list[str]]:
                             return rows
     except Exception:
         pass
-
     return rows
 
 
 # ═══════════════════════════════════════════════════════════════════
-# TALLY PDF DETECTION
+# SOFTWARE / FORMAT DETECTION
 # ═══════════════════════════════════════════════════════════════════
 
 def is_tally_pdf(file) -> bool:
-    """
-    Returns True if the PDF appears to be a Tally export.
-    Tally PDFs are notoriously bad for machine parsing — merged cells,
-    custom fonts, no consistent column structure.
-    The UI uses this to recommend CSV export instead.
-    """
     raw = file.read() if hasattr(file, "read") else file
     buf = io.BytesIO(raw)
     try:
@@ -523,6 +602,34 @@ def is_tally_pdf(file) -> bool:
     return False
 
 
+def detect_books_software(file, filename: str) -> Optional[str]:
+    """
+    Sniff books file to suggest which software parser to use.
+    Returns a BOOKS_SOFTWARE key string or None.
+    """
+    fn = filename.lower()
+    if fn.endswith(".iif"):
+        return "QuickBooks IIF"
+    if fn.endswith(".qif"):
+        return "QIF"
+    if fn.endswith((".ofx", ".qbo", ".qfx")):
+        return "OFX / QBO"
+    if fn.endswith(".csv"):
+        raw = file.read(2048) if hasattr(file, "read") else b""
+        if hasattr(file, "seek"):
+            file.seek(0)
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="replace")
+        raw_lower = raw.lower()
+        if "taxtype" in raw_lower or "accountcode" in raw_lower:
+            return "Xero CSV"
+        if "gst code" in raw_lower or "tax code" in raw_lower:
+            return "MYOB CSV"
+        if "account name" in raw_lower and "wave" in raw_lower:
+            return "Wave CSV"
+    return None
+
+
 # ═══════════════════════════════════════════════════════════════════
 # DIGITAL PDF EXTRACTION
 # ═══════════════════════════════════════════════════════════════════
@@ -533,6 +640,7 @@ def extract_from_pdf(
     source: str,
     password: str = "",
     base_currency: str = "INR",
+    region: str = "IN",
 ) -> list[Transaction]:
     transactions: list[Transaction] = []
     file = unlock_pdf(file, password)
@@ -554,29 +662,124 @@ def extract_from_pdf(
     if not all_rows:
         return transactions
 
-    header_idx, auto_map = _find_header(all_rows)
-    col_map    = fmt_config or auto_map or {"date": 0, "narration": 1, "debit": 2, "credit": 3}
-    date_col   = col_map.get("date", 0)
-    narr_col   = col_map.get("narration", 1)
-    debit_col  = col_map.get("debit", 2)
-    credit_col = col_map.get("credit", 3)
-
-    data_rows = _merge_wrapped_rows(all_rows[header_idx + 1:], date_col)
+    no_header = fmt_config.get("no_header", False) if fmt_config else False
+    if no_header:
+        col_map   = {k: v for k, v in fmt_config.items() if k not in ("no_header", "date_fmt")}
+        data_rows = all_rows
+    else:
+        header_idx, auto_map = _find_header(all_rows)
+        col_map   = fmt_config or auto_map or {"date": 0, "narration": 1, "debit": 2, "credit": 3}
+        col_map   = {k: v for k, v in col_map.items() if k not in ("no_header", "date_fmt")}
+        data_rows = _merge_wrapped_rows(all_rows[header_idx + 1:], col_map.get("date", 0))
 
     for row in data_rows:
         if _is_junk_row(row):
             continue
         try:
-            parsed_date = _parse_date(str(row[date_col] if date_col < len(row) else ""))
-            if not parsed_date:
-                continue
-            narration = _clean_text(str(row[narr_col] if narr_col < len(row) else ""))
+            transactions.extend(_parse_data_row(row, col_map, source, base_currency, region))
+        except (IndexError, AttributeError):
+            continue
 
-            for raw_val, base_type in (
-                (row[debit_col]  if debit_col  < len(row) else "", "debit"),
-                (row[credit_col] if credit_col < len(row) else "", "credit"),
-            ):
-                amount, currency, is_reversal = _parse_amount(str(raw_val or ""))
+    return transactions
+
+
+# ═══════════════════════════════════════════════════════════════════
+# BANK CSV EXTRACTION  (positional col_map — for bank statements)
+# ═══════════════════════════════════════════════════════════════════
+
+def extract_bank_csv(
+    file,
+    fmt_config: Optional[dict],
+    source: str,
+    base_currency: str = "INR",
+    region: str = "IN",
+) -> list[Transaction]:
+    """
+    Extract from a bank-downloaded CSV using positional col_map.
+    Handles Wells Fargo no-header, signed amounts, split debit/credit.
+    """
+    raw = file.read() if hasattr(file, "read") else file
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="replace")
+
+    df = pd.read_csv(io.StringIO(raw), header=None, dtype=str)
+    all_rows = df.values.tolist()
+
+    if not fmt_config:
+        # Fall back to name-based generic detection
+        return extract_from_csv(io.StringIO(raw), source, base_currency, region)
+
+    no_header = fmt_config.get("no_header", False)
+    col_map   = {k: v for k, v in fmt_config.items() if k not in ("no_header", "date_fmt")}
+    data_rows = all_rows if no_header else all_rows[1:]
+
+    transactions: list[Transaction] = []
+    for row in data_rows:
+        if _is_junk_row(row):
+            continue
+        try:
+            transactions.extend(_parse_data_row(row, col_map, source, base_currency, region))
+        except (IndexError, AttributeError):
+            continue
+    return transactions
+
+
+# ═══════════════════════════════════════════════════════════════════
+# GENERIC CSV EXTRACTION  (name-based — for Tally / books)
+# ═══════════════════════════════════════════════════════════════════
+
+def extract_from_csv(
+    file,
+    source: str,
+    base_currency: str = "INR",
+    region: str = "IN",
+) -> list[Transaction]:
+    df = pd.read_csv(file, dtype=str)
+    df.columns = [_clean_text(c).lower() for c in df.columns]
+
+    def _find_col(patterns: list[str]) -> Optional[str]:
+        for pat in patterns:
+            match = next((c for c in df.columns if pat in c), None)
+            if match:
+                return match
+        return None
+
+    date_col  = _find_col(["date"])
+    narr_col  = _find_col(["narr", "desc", "particular", "remark", "detail", "memo", "name"])
+    debit_col = _find_col(["debit", "dr", "withdraw", "paid", "money out"])
+    cred_col  = _find_col(["credit", "cr", "deposit", "received", "money in"])
+    amt_col   = _find_col(["amount", "amt"]) if not (debit_col or cred_col) else None
+
+    if not date_col:
+        raise ValueError("Cannot detect date column. Rename it to 'Date' and re-upload.")
+
+    transactions: list[Transaction] = []
+    for _, row in df.iterrows():
+        narration   = _clean_text(str(row.get(narr_col, "") or "")) if narr_col else ""
+        parsed_date = _parse_date(str(row.get(date_col, "") or ""), region)
+        if not parsed_date:
+            continue
+
+        if amt_col:
+            amount, currency, is_reversal = _parse_amount(
+                str(row.get(amt_col, "") or ""), region
+            )
+            if amount is None:
+                continue
+            txn_type = "debit" if amount < 0 else "credit"
+            note = f"[{currency}] {narration}" if currency != base_currency else narration
+            transactions.append(Transaction(
+                date=parsed_date, amount=round(abs(amount), 2),
+                narration=note, txn_type=txn_type,
+                source=source, currency=currency, is_reversal=is_reversal,
+            ))
+        else:
+            for col, base_type in ((debit_col, "debit"), (cred_col, "credit")):
+                if not col:
+                    continue
+                amount, currency, is_reversal = _parse_amount(
+                    str(row.get(col, "") or ""), region
+                )
                 if amount is None:
                     continue
                 txn_type = base_type
@@ -589,59 +792,417 @@ def extract_from_pdf(
                     date=parsed_date, amount=round(amount, 2),
                     narration=note, txn_type=txn_type,
                     source=source, currency=currency, is_reversal=is_reversal,
-                    raw={"row": row},
                 ))
-        except (IndexError, AttributeError):
+    return transactions
+
+
+# ═══════════════════════════════════════════════════════════════════
+# OFX / QBO / QFX EXTRACTION
+# ═══════════════════════════════════════════════════════════════════
+
+def extract_from_ofx(file, source: str, region: str = "US") -> list[Transaction]:
+    """
+    Parses OFX / QBO / QFX files (same internal structure).
+    Tags: DTPOSTED, TRNAMT, NAME, MEMO, TRNTYPE, FITID.
+    Date format: YYYYMMDD or YYYYMMDDHHMMSS.
+    Negative TRNAMT = debit; TRNTYPE provides a confirmation signal.
+    """
+    raw = file.read() if hasattr(file, "read") else file
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="replace")
+
+    base_currency = _REGION_CURRENCY.get(region, "USD")
+    blocks        = re.findall(r"<STMTTRN>(.*?)</STMTTRN>", raw, re.DOTALL | re.IGNORECASE)
+    transactions: list[Transaction] = []
+
+    def _tag(tag: str, block: str) -> str:
+        m = re.search(rf"<{tag}>(.*?)(?:</{tag}>|<|\n)", block, re.IGNORECASE)
+        return m.group(1).strip() if m else ""
+
+    for block in blocks:
+        raw_date = _tag("DTPOSTED", block)
+        if len(raw_date) >= 8:
+            raw_date = raw_date[:8]
+        parsed_date = _parse_date(raw_date, region)
+        if not parsed_date:
             continue
+
+        raw_amt = _tag("TRNAMT", block)
+        amount, currency, _ = _parse_amount(raw_amt, region)
+        if amount is None:
+            continue
+
+        narration  = _clean_text(_tag("NAME", block) or _tag("MEMO", block) or _tag("FITID", block))
+        trntype    = _tag("TRNTYPE", block).upper()
+        _DEBIT_TYPES  = {"DEBIT", "ATM", "CHECK", "PAYMENT", "CASH", "DIRECTDEBIT", "FEE", "SRVCHG"}
+        _CREDIT_TYPES = {"CREDIT", "DEP", "DIRECTDEP", "INT", "DIVIDEND", "REFUND"}
+
+        if trntype in _DEBIT_TYPES:
+            txn_type = "debit"
+            amount   = abs(amount)
+        elif trntype in _CREDIT_TYPES:
+            txn_type = "credit"
+            amount   = abs(amount)
+        else:
+            txn_type = "debit" if amount < 0 else "credit"
+            amount   = abs(amount)
+
+        note = f"[{currency}] {narration}" if currency != base_currency else narration
+        transactions.append(Transaction(
+            date=parsed_date, amount=round(amount, 2),
+            narration=note, txn_type=txn_type,
+            source=source, currency=currency,
+        ))
 
     return transactions
 
 
 # ═══════════════════════════════════════════════════════════════════
-# CSV EXTRACTION
+# QIF EXTRACTION  (MYOB preferred import, Macquarie export)
 # ═══════════════════════════════════════════════════════════════════
 
-def extract_from_csv(file, source: str, base_currency: str = "INR") -> list[Transaction]:
+def extract_from_qif(file, source: str, region: str = "AU") -> list[Transaction]:
+    """
+    Parses QIF files.
+    D=date, T=amount (negative=debit), P=payee, M=memo, ^=record end.
+    """
+    raw = file.read() if hasattr(file, "read") else file
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="replace")
+
+    base_currency = _REGION_CURRENCY.get(region, "AUD")
+    transactions: list[Transaction] = []
+    current: dict = {}
+
+    for line in raw.splitlines():
+        line   = line.strip()
+        if not line or line.startswith("!"):
+            continue
+        prefix = line[0]
+        value  = line[1:].strip()
+
+        if prefix == "D":
+            current["date"]   = value
+        elif prefix == "T":
+            current["amount"] = value
+        elif prefix == "P":
+            current["payee"]  = value
+        elif prefix == "M":
+            current["memo"]   = value
+        elif prefix == "^":
+            if "date" in current and "amount" in current:
+                parsed_date = _parse_date(current["date"], region)
+                amount, currency, is_reversal = _parse_amount(
+                    current["amount"], region
+                )
+                if parsed_date and amount is not None:
+                    narration = _clean_text(
+                        current.get("payee") or current.get("memo") or ""
+                    )
+                    txn_type = "debit" if amount < 0 else "credit"
+                    note = f"[{currency}] {narration}" if currency != base_currency else narration
+                    transactions.append(Transaction(
+                        date=parsed_date, amount=round(abs(amount), 2),
+                        narration=note, txn_type=txn_type,
+                        source=source, currency=currency, is_reversal=is_reversal,
+                    ))
+            current = {}
+
+    return transactions
+
+
+# ═══════════════════════════════════════════════════════════════════
+# IIF EXTRACTION  (QuickBooks Desktop)
+# ═══════════════════════════════════════════════════════════════════
+
+def extract_from_iif(file, source: str, region: str = "US") -> list[Transaction]:
+    """
+    Parses QuickBooks Desktop IIF files (tab-separated).
+    TRNS records only (SPL split lines are skipped — amounts already on TRNS).
+    """
+    raw = file.read() if hasattr(file, "read") else file
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="replace")
+
+    base_currency = _REGION_CURRENCY.get(region, "USD")
+    transactions: list[Transaction] = []
+    headers: list[str] = []
+
+    for line in raw.splitlines():
+        line = line.strip()
+        if line.startswith("!TRNS"):
+            headers = [h.strip().lower() for h in line.split("\t")[1:]]
+        elif line.startswith("TRNS") and headers:
+            values = line.split("\t")[1:]
+            row    = dict(zip(headers, values))
+            date_str   = row.get("date", "")
+            amount_str = row.get("amount", "")
+            narration  = _clean_text(row.get("memo") or row.get("name") or row.get("accnt", ""))
+            parsed_date = _parse_date(date_str, region)
+            amount, currency, _ = _parse_amount(amount_str, region)
+            if not parsed_date or amount is None:
+                continue
+            txn_type = "debit" if amount < 0 else "credit"
+            note = f"[{currency}] {narration}" if currency != base_currency else narration
+            transactions.append(Transaction(
+                date=parsed_date, amount=round(abs(amount), 2),
+                narration=note, txn_type=txn_type,
+                source=source, currency=currency,
+            ))
+
+    return transactions
+
+
+# ═══════════════════════════════════════════════════════════════════
+# QUICKBOOKS CSV  (3-col or 4-col)
+# ═══════════════════════════════════════════════════════════════════
+
+def extract_from_quickbooks_csv(
+    file, source: str, region: str = "US"
+) -> list[Transaction]:
+    """
+    QuickBooks Online bank CSV export.
+    3-col: Date, Description, Amount  (negative = debit)
+    4-col: Date, Description, Debit, Credit
+    """
     df = pd.read_csv(file, dtype=str)
     df.columns = [_clean_text(c).lower() for c in df.columns]
 
-    def _find_col(patterns: list[str]) -> Optional[str]:
-        for pat in patterns:
-            match = next((c for c in df.columns if pat in c), None)
-            if match:
-                return match
-        return None
-
-    date_col  = _find_col(["date"])
-    narr_col  = _find_col(["narr", "desc", "particular", "remark", "detail"])
-    debit_col = _find_col(["debit", "dr", "withdraw", "paid"])
-    cred_col  = _find_col(["credit", "cr", "deposit", "received"])
+    date_col   = next((c for c in df.columns if "date" in c), None)
+    desc_col   = next((c for c in df.columns
+                       if any(k in c for k in ["description", "memo", "name", "narr", "particular"])),
+                      None)
+    debit_col  = next((c for c in df.columns if "debit" in c), None)
+    credit_col = next((c for c in df.columns if "credit" in c), None)
+    amt_col    = next((c for c in df.columns if c == "amount"), None)
 
     if not date_col:
-        raise ValueError("Cannot detect date column. Rename it to 'Date' and re-upload.")
+        raise ValueError("No date column found in QuickBooks CSV.")
+
+    base_currency = _REGION_CURRENCY.get(region, "USD")
+    transactions: list[Transaction] = []
+
+    for _, row in df.iterrows():
+        parsed_date = _parse_date(str(row.get(date_col, "") or ""), region)
+        if not parsed_date:
+            continue
+        narration = _clean_text(str(row.get(desc_col, "") or "")) if desc_col else ""
+
+        if debit_col and credit_col:
+            for col, base_type in ((debit_col, "debit"), (credit_col, "credit")):
+                amount, currency, _ = _parse_amount(str(row.get(col, "") or ""), region)
+                if amount is None:
+                    continue
+                note = f"[{currency}] {narration}" if currency != base_currency else narration
+                transactions.append(Transaction(
+                    date=parsed_date, amount=round(abs(amount), 2),
+                    narration=note, txn_type=base_type,
+                    source=source, currency=currency,
+                ))
+        elif amt_col:
+            amount, currency, _ = _parse_amount(str(row.get(amt_col, "") or ""), region)
+            if amount is None:
+                continue
+            txn_type = "debit" if amount < 0 else "credit"
+            note = f"[{currency}] {narration}" if currency != base_currency else narration
+            transactions.append(Transaction(
+                date=parsed_date, amount=round(abs(amount), 2),
+                narration=note, txn_type=txn_type,
+                source=source, currency=currency,
+            ))
+
+    return transactions
+
+
+# ═══════════════════════════════════════════════════════════════════
+# XERO CSV  (basic + precoded)
+# ═══════════════════════════════════════════════════════════════════
+
+def extract_from_xero_csv(file, source: str, region: str = "AU") -> list[Transaction]:
+    """
+    Xero CSV formats:
+      Basic    : Date, Amount, Payee, Description, Reference
+      Precoded : + AccountCode, TaxType, TaxAmount (AU/NZ)
+    Amount: positive = money in (credit), negative = money out (debit).
+    """
+    df = pd.read_csv(file, dtype=str)
+    df.columns = [_clean_text(c).lower() for c in df.columns]
+
+    date_col   = next((c for c in df.columns if "date" in c), None)
+    amount_col = next((c for c in df.columns if c == "amount"), None)
+    payee_col  = next((c for c in df.columns if "payee" in c or "contact" in c), None)
+    desc_col   = next((c for c in df.columns
+                       if any(k in c for k in ["description", "narr", "memo", "reference"])),
+                      None)
+
+    if not date_col:
+        raise ValueError("No date column found in Xero CSV.")
+
+    base_currency = _REGION_CURRENCY.get(region, "AUD")
+    transactions: list[Transaction] = []
+
+    for _, row in df.iterrows():
+        parsed_date = _parse_date(str(row.get(date_col, "") or ""), region)
+        if not parsed_date:
+            continue
+
+        parts = []
+        if payee_col and row.get(payee_col):
+            parts.append(_clean_text(str(row[payee_col])))
+        if desc_col and row.get(desc_col):
+            parts.append(_clean_text(str(row[desc_col])))
+        narration = " — ".join(p for p in parts if p)
+
+        if amount_col:
+            amount, currency, _ = _parse_amount(str(row.get(amount_col, "") or ""), region)
+            if amount is None:
+                continue
+            txn_type = "debit" if amount < 0 else "credit"
+            note = f"[{currency}] {narration}" if currency != base_currency else narration
+            transactions.append(Transaction(
+                date=parsed_date, amount=round(abs(amount), 2),
+                narration=note, txn_type=txn_type,
+                source=source, currency=currency,
+            ))
+
+    return transactions
+
+
+# ═══════════════════════════════════════════════════════════════════
+# MYOB CSV
+# ═══════════════════════════════════════════════════════════════════
+
+def extract_from_myob_csv(file, source: str) -> list[Transaction]:
+    """
+    MYOB AccountRight / Essentials CSV.
+    Columns: Date, Description, Amount, [GST Code], [Reference], [Account], [Job]
+    Comma or tab separated. Amount: positive = deposit, negative = withdrawal.
+    """
+    raw = file.read() if hasattr(file, "read") else file
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="replace")
+
+    sep = "\t" if raw.count("\t") > raw.count(",") else ","
+    df  = pd.read_csv(io.StringIO(raw), sep=sep, dtype=str)
+    df.columns = [_clean_text(c).lower() for c in df.columns]
+
+    date_col   = next((c for c in df.columns if "date" in c), None)
+    desc_col   = next((c for c in df.columns
+                       if any(k in c for k in ["description", "memo", "narr", "particular"])),
+                      None)
+    amount_col = next((c for c in df.columns if "amount" in c), None)
+
+    if not date_col:
+        raise ValueError("No date column found in MYOB CSV.")
 
     transactions: list[Transaction] = []
     for _, row in df.iterrows():
-        narration   = _clean_text(str(row.get(narr_col, "") or "")) if narr_col else ""
-        parsed_date = _parse_date(str(row.get(date_col, "") or ""))
+        parsed_date = _parse_date(str(row.get(date_col, "") or ""), "AU")
         if not parsed_date:
             continue
-        for col, base_type in ((debit_col, "debit"), (cred_col, "credit")):
-            if not col:
-                continue
-            amount, currency, is_reversal = _parse_amount(str(row.get(col, "") or ""))
+        narration = _clean_text(str(row.get(desc_col, "") or "")) if desc_col else ""
+        if amount_col:
+            amount, _, _ = _parse_amount(str(row.get(amount_col, "") or ""), "AU")
             if amount is None:
                 continue
-            txn_type = base_type
-            if amount < 0:
-                txn_type    = "credit" if base_type == "debit" else "debit"
-                amount      = abs(amount)
-                is_reversal = True
+            txn_type = "debit" if amount < 0 else "credit"
+            transactions.append(Transaction(
+                date=parsed_date, amount=round(abs(amount), 2),
+                narration=narration, txn_type=txn_type,
+                source=source, currency="AUD",
+            ))
+    return transactions
+
+
+# ═══════════════════════════════════════════════════════════════════
+# WAVE CSV
+# ═══════════════════════════════════════════════════════════════════
+
+def extract_from_wave_csv(file, source: str, region: str = "US") -> list[Transaction]:
+    """Wave Accounting CSV export. Date, Description, Amount, Account Name."""
+    df = pd.read_csv(file, dtype=str)
+    df.columns = [_clean_text(c).lower() for c in df.columns]
+
+    date_col   = next((c for c in df.columns if "date" in c), None)
+    desc_col   = next((c for c in df.columns
+                       if any(k in c for k in ["description", "memo", "narr"])), None)
+    amount_col = next((c for c in df.columns if "amount" in c), None)
+
+    if not date_col:
+        raise ValueError("No date column found in Wave CSV.")
+
+    base_currency = _REGION_CURRENCY.get(region, "USD")
+    transactions: list[Transaction] = []
+
+    for _, row in df.iterrows():
+        parsed_date = _parse_date(str(row.get(date_col, "") or ""), region)
+        if not parsed_date:
+            continue
+        narration = _clean_text(str(row.get(desc_col, "") or "")) if desc_col else ""
+        if amount_col:
+            amount, currency, _ = _parse_amount(str(row.get(amount_col, "") or ""), region)
+            if amount is None:
+                continue
+            txn_type = "debit" if amount < 0 else "credit"
             note = f"[{currency}] {narration}" if currency != base_currency else narration
             transactions.append(Transaction(
-                date=parsed_date, amount=round(amount, 2),
+                date=parsed_date, amount=round(abs(amount), 2),
                 narration=note, txn_type=txn_type,
-                source=source, currency=currency, is_reversal=is_reversal,
+                source=source, currency=currency,
+            ))
+    return transactions
+
+
+# ═══════════════════════════════════════════════════════════════════
+# FRESHBOOKS CSV
+# ═══════════════════════════════════════════════════════════════════
+
+def extract_from_freshbooks_csv(file, source: str, region: str = "US") -> list[Transaction]:
+    """FreshBooks transaction export CSV. Date, Type, Debit, Credit, Balance, Description."""
+    df = pd.read_csv(file, dtype=str)
+    df.columns = [_clean_text(c).lower() for c in df.columns]
+
+    date_col   = next((c for c in df.columns if "date" in c), None)
+    desc_col   = next((c for c in df.columns
+                       if any(k in c for k in ["description", "memo", "narr", "type"])), None)
+    debit_col  = next((c for c in df.columns if "debit" in c), None)
+    credit_col = next((c for c in df.columns if "credit" in c), None)
+    amt_col    = next((c for c in df.columns if "amount" in c), None) \
+                 if not (debit_col and credit_col) else None
+
+    if not date_col:
+        raise ValueError("No date column found in FreshBooks CSV.")
+
+    base_currency = _REGION_CURRENCY.get(region, "USD")
+    transactions: list[Transaction] = []
+
+    for _, row in df.iterrows():
+        parsed_date = _parse_date(str(row.get(date_col, "") or ""), region)
+        if not parsed_date:
+            continue
+        narration = _clean_text(str(row.get(desc_col, "") or "")) if desc_col else ""
+
+        if debit_col and credit_col:
+            for col, base_type in ((debit_col, "debit"), (credit_col, "credit")):
+                amount, currency, _ = _parse_amount(str(row.get(col, "") or ""), region)
+                if amount is None:
+                    continue
+                note = f"[{currency}] {narration}" if currency != base_currency else narration
+                transactions.append(Transaction(
+                    date=parsed_date, amount=round(abs(amount), 2),
+                    narration=note, txn_type=base_type,
+                    source=source, currency=currency,
+                ))
+        elif amt_col:
+            amount, currency, _ = _parse_amount(str(row.get(amt_col, "") or ""), region)
+            if amount is None:
+                continue
+            txn_type = "debit" if amount < 0 else "credit"
+            note = f"[{currency}] {narration}" if currency != base_currency else narration
+            transactions.append(Transaction(
+                date=parsed_date, amount=round(abs(amount), 2),
+                narration=note, txn_type=txn_type,
+                source=source, currency=currency,
             ))
     return transactions
 
@@ -740,8 +1301,10 @@ def _match_splits(
         pool, pool_idx = [e[1] for e in eligible], [e[0] for e in eligible]
         combo = _subset_indices(b.amount, pool, amount_tol)
         if combo:
-            matched.append(MatchResult("1:N", [b], [pool[k] for k in combo], 100.0,
-                                       notes=f"Bank ₹{b.amount} = {len(combo)} book entries"))
+            matched.append(MatchResult(
+                "1:N", [b], [pool[k] for k in combo], 100.0,
+                notes=f"1 bank entry = {len(combo)} book entries (split)",
+            ))
             used_bank.add(i)
             for k in combo:
                 used_books.add(pool_idx[k])
@@ -771,8 +1334,10 @@ def _match_consolidated(
         pool, pool_idx = [e[1] for e in eligible], [e[0] for e in eligible]
         combo = _subset_indices(bk.amount, pool, amount_tol)
         if combo:
-            matched.append(MatchResult("N:1", [pool[k] for k in combo], [bk], 100.0,
-                                       notes=f"{len(combo)} bank entries = Books ₹{bk.amount}"))
+            matched.append(MatchResult(
+                "N:1", [pool[k] for k in combo], [bk], 100.0,
+                notes=f"{len(combo)} bank entries = 1 book entry (consolidated)",
+            ))
             used_books.add(j)
             for k in combo:
                 used_bank.add(pool_idx[k])
@@ -838,21 +1403,27 @@ def reconcile(
 # EXCEL EXPORT
 # ═══════════════════════════════════════════════════════════════════
 
-def to_excel(result: dict) -> bytes:
+def to_excel(result: dict, currency_symbol: str = "") -> bytes:
     output = io.BytesIO()
+    sym    = currency_symbol or ""
 
     def _txn_dict(t: Transaction) -> dict:
-        return {"Date": t.date, "Narration": t.narration,
-                "Amount (₹)": t.amount, "Type": t.txn_type, "Currency": t.currency}
+        return {
+            "Date": t.date, "Narration": t.narration,
+            f"Amount{' (' + sym + ')' if sym else ''}": t.amount,
+            "Type": t.txn_type, "Currency": t.currency,
+        }
 
     matched_rows = [{
         "Match Type":        m.match_type,
         "Date (Bank)":       ", ".join(t.date      for t in m.bank),
         "Narration (Bank)":  ", ".join(t.narration for t in m.bank),
-        "Amount (Bank ₹)":   round(sum(t.amount    for t in m.bank),  2),
+        f"Amt (Bank{' ' + sym if sym else ''})":
+                             round(sum(t.amount for t in m.bank), 2),
         "Date (Books)":      ", ".join(t.date      for t in m.books) if m.books else "—",
         "Narration (Books)": ", ".join(t.narration for t in m.books) if m.books else "—",
-        "Amount (Books ₹)":  round(sum(t.amount    for t in m.books), 2) if m.books else 0,
+        f"Amt (Books{' ' + sym if sym else ''})":
+                             round(sum(t.amount for t in m.books), 2) if m.books else 0,
         "Score":             f"{m.score}%",
         "Notes":             m.notes,
     } for m in result["matched"]]
@@ -873,7 +1444,7 @@ def to_excel(result: dict) -> bytes:
     ])
 
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        summary_df.to_excel(writer, sheet_name="Summary",          index=False)
+        summary_df.to_excel(writer, sheet_name="Summary", index=False)
         pd.DataFrame(matched_rows).to_excel(writer, sheet_name="Matched", index=False)
         pd.DataFrame([_txn_dict(t) | {"Remark": "In Bank — Not in Books"}
                       for t in result["unmatched_bank"]]).to_excel(
