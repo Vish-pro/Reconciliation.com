@@ -83,7 +83,80 @@ Your CSV should have these columns (names are flexible, case-insensitive):
 
 Yes. Your files are processed **in your browser session only** and are **never saved to any server or disk**.
 
-However, if you use the hosted (cloud) version, data does pass through Streamlit's servers in the US. For sensitive client financial data (CA/audit use), we recommend **running it locally** (see developer section below).
+However, if you use the hosted (cloud) version, data does pass through Streamlit's servers in the US. For sensitive client financial data (CA/audit use), we recommend **running it locally** — see the guide below.
+
+---
+
+### 🖥️ Run on Your Own Computer (No Coding Knowledge Needed)
+
+Running locally means your data never leaves your machine. Follow the steps for your operating system:
+
+---
+
+#### Windows
+
+**Step 1 — Install Python**
+1. Go to [python.org/downloads](https://www.python.org/downloads/)
+2. Click **Download Python** (latest version)
+3. Run the installer — **important:** tick the box that says **"Add Python to PATH"** before clicking Install
+
+**Step 2 — Download this tool**
+1. On this GitHub page, click the green **Code** button
+2. Click **Download ZIP**
+3. Extract (unzip) the downloaded file to any folder, e.g. your Desktop
+
+**Step 3 — Install the tool's dependencies**
+1. Open the extracted folder
+2. Click on the address bar at the top of the folder window, type `cmd`, press Enter — a black window opens
+3. Type this and press Enter:
+   ```
+   pip install -r requirements.txt
+   ```
+4. Wait for it to finish (may take 2-3 minutes)
+
+**Step 4 — Run the app**
+1. In the same black window, type this and press Enter:
+   ```
+   streamlit run app.py
+   ```
+2. Your browser will open automatically at `http://localhost:8501`
+3. The app is now running fully on your computer
+
+> Next time you want to use it, just open `cmd` in the folder and run `streamlit run app.py` — no need to install again.
+
+---
+
+#### Mac
+
+**Step 1 — Install Python**
+1. Go to [python.org/downloads](https://www.python.org/downloads/)
+2. Download and install the latest Python version for macOS
+
+**Step 2 — Download this tool**
+1. On this GitHub page, click the green **Code** button
+2. Click **Download ZIP**
+3. Extract the ZIP — it will appear in your Downloads folder
+
+**Step 3 — Install dependencies**
+1. Open **Terminal** (press `Cmd + Space`, type Terminal, press Enter)
+2. Navigate to the folder:
+   ```
+   cd ~/Downloads/reconciliation.com-main
+   ```
+3. Install dependencies:
+   ```
+   pip3 install -r requirements.txt
+   ```
+
+**Step 4 — Run the app**
+```
+streamlit run app.py
+```
+Your browser will open at `http://localhost:8501`.
+
+---
+
+> **Having trouble?** Open an [Issue on GitHub](../../issues) and describe the error message — we'll help you fix it.
 
 ---
 
