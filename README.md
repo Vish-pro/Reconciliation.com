@@ -1,40 +1,182 @@
 # 🏦 Bank Reconciliation Tool
 
-> Streamlit app to reconcile bank statements vs books. Supports digital/scanned PDFs, CSV, OCR, password-protected files & custom column mapping. Detects splits, consolidations & reversals. Excel report export.
+> Free, open-source tool to reconcile your bank statement with your books in minutes. Upload files, click a button, download an Excel report.
 
 ---
 
-## Features
+## 👤 For Users (No Coding Needed)
 
-| Feature | Detail |
+### What does this tool do?
+It compares your **bank statement** with your **Tally/books ledger** and tells you:
+- Which entries match ✅
+- Which are in the bank but missing from books ❌
+- Which are in books but missing from bank ❌
+- Splits, consolidations, and reversals are detected automatically
+
+### How to use it (3 steps)
+
+**Step 1 — Open the app**
+👉 Open the hosted app URL in your browser (works on mobile too)
+
+**Step 2 — Upload your files**
+- Upload your **bank statement** (PDF or CSV)
+- Upload your **books/ledger** (PDF or CSV exported from Tally)
+- Select your bank name (HDFC, SBI, Axis, ICICI, Kotak — or Auto-Detect)
+
+**Step 3 — Run & Download**
+- Click **Run Reconciliation**
+- Download the Excel report — it has 4 sheets:
+  - **Summary** — overview of matches and gaps
+  - **Matched** — all entries that matched
+  - **Unmatched Bank** — entries in bank but not in books
+  - **Unmatched Books** — entries in books but not in bank
+
+---
+
+### Supported File Formats
+
+| What to upload | Accepted formats |
 |---|---|
-| **Input formats** | Bank PDF · Books PDF · Books CSV (Tally export recommended) |
-| **Bank formats** | HDFC · SBI · Axis · ICICI · Kotak · Auto-Detect · Custom mapper |
-| **Scanned PDFs** | Auto-detected · OCR via Tesseract (bounding-box layout reconstruction) |
-| **Password PDFs** | Unlocked in-memory via pikepdf |
-| **Match types** | 1:1 direct · 1:N split · N:1 consolidated · Reversal pairs |
-| **Matching engine** | Hungarian algorithm (globally optimal, no duplicate matches) |
-| **Data quality** | Junk row filter · narration merge · unicode cleanup · 15 date formats |
-| **Multi-currency** | ₹ / $ / € / £ — foreign entries flagged, still matched |
-| **Export** | Excel report — Summary · Matched · Unmatched Bank · Unmatched Books |
-| **Scale** | Amount-bucket index · 200-row UI pagination |
+| Bank Statement | PDF (digital or scanned), CSV |
+| Books / Ledger | PDF, CSV (Tally export recommended) |
+
+> **Scanned or handwritten PDFs?** The tool uses OCR to read them automatically.
+> **Password-protected PDF?** Enter the password when prompted — it's unlocked in your browser only, never stored.
 
 ---
 
-## Quick Start
+### How to export from Tally
 
-### Hosted (no install)
-Open the app URL → upload files → click **Run Reconciliation** → download report.
+> Gateway of Tally → Display → Account Books → Ledger → Export → **Excel / CSV**
+
+Your CSV should have these columns (names are flexible, case-insensitive):
+
+| Column | Accepted column names |
+|---|---|
+| Date | `date` |
+| Narration | `narration`, `description`, `particulars`, `remarks` |
+| Debit | `debit`, `dr`, `withdrawal` |
+| Credit | `credit`, `cr`, `deposit` |
+
+---
+
+### My bank isn't in the list — what do I do?
+
+1. Select **Custom** from the Bank Format dropdown
+2. A preview of your PDF table will appear
+3. Use the 4 dropdowns to tell the tool which column is Date / Narration / Debit / Credit
+4. Run reconciliation
+
+---
+
+### Settings you can adjust
+
+| Setting | Default | What it means |
+|---|---|---|
+| Amount Tolerance | ₹0.01 | Allows tiny rounding differences to still match |
+| Narration Match % | 60% | How closely descriptions must match — lower this for UPI/NEFT codes |
+| Date Tolerance | 2 days | Allows entries recorded a day or two apart to still match |
+
+---
+
+### 🔒 Is my data safe?
+
+Yes. Your files are processed **in your browser session only** and are **never saved to any server or disk**.
+
+However, if you use the hosted (cloud) version, data does pass through Streamlit's servers in the US. For sensitive client financial data (CA/audit use), we recommend **running it locally** — see the guide below.
+
+---
+
+### 🖥️ Run on Your Own Computer (No Coding Knowledge Needed)
+
+Running locally means your data never leaves your machine. Follow the steps for your operating system:
+
+---
+
+#### Windows
+
+**Step 1 — Install Python**
+1. Go to [python.org/downloads](https://www.python.org/downloads/)
+2. Click **Download Python** (latest version)
+3. Run the installer — **important:** tick the box that says **"Add Python to PATH"** before clicking Install
+
+**Step 2 — Download this tool**
+1. On this GitHub page, click the green **Code** button
+2. Click **Download ZIP**
+3. Extract (unzip) the downloaded file to any folder, e.g. your Desktop
+
+**Step 3 — Install the tool's dependencies**
+1. Open the extracted folder
+2. Click on the address bar at the top of the folder window, type `cmd`, press Enter — a black window opens
+3. Type this and press Enter:
+   ```
+   pip install -r requirements.txt
+   ```
+4. Wait for it to finish (may take 2-3 minutes)
+
+**Step 4 — Run the app**
+1. In the same black window, type this and press Enter:
+   ```
+   streamlit run app.py
+   ```
+2. Your browser will open automatically at `http://localhost:8501`
+3. The app is now running fully on your computer
+
+> Next time you want to use it, just open `cmd` in the folder and run `streamlit run app.py` — no need to install again.
+
+---
+
+#### Mac
+
+**Step 1 — Install Python**
+1. Go to [python.org/downloads](https://www.python.org/downloads/)
+2. Download and install the latest Python version for macOS
+
+**Step 2 — Download this tool**
+1. On this GitHub page, click the green **Code** button
+2. Click **Download ZIP**
+3. Extract the ZIP — it will appear in your Downloads folder
+
+**Step 3 — Install dependencies**
+1. Open **Terminal** (press `Cmd + Space`, type Terminal, press Enter)
+2. Navigate to the folder:
+   ```
+   cd ~/Downloads/reconciliation.com-main
+   ```
+3. Install dependencies:
+   ```
+   pip3 install -r requirements.txt
+   ```
+
+**Step 4 — Run the app**
+```
+streamlit run app.py
+```
+Your browser will open at `http://localhost:8501`.
+
+---
+
+> **Having trouble?** Open an [Issue on GitHub](../../issues) and describe the error message — we'll help you fix it.
+
+---
+
+## 💻 For Developers
 
 ### Run locally
+
 ```bash
-git clone https://github.com/YOUR_USERNAME/reconcile-app.git
-cd reconcile-app
+git clone https://github.com/vish-pro/reconciliation.com.git
+cd reconciliation.com
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
-For scanned PDF support, also install Tesseract:
+Open `http://localhost:8501` in your browser.
+
+### Scanned PDF support (OCR)
+
+Install Tesseract on your system:
+
 ```bash
 # Ubuntu / Debian
 sudo apt install tesseract-ocr poppler-utils
@@ -46,30 +188,15 @@ brew install tesseract poppler
 # Download installer: https://github.com/UB-Mannheim/tesseract/wiki
 ```
 
----
-
-## Deploy to Streamlit Cloud
+### Deploy to Streamlit Cloud (free hosting)
 
 1. Fork this repo
 2. Go to [share.streamlit.io](https://share.streamlit.io) → **New app**
 3. Select your fork → set entry point to `app.py` → **Deploy**
 
-`packages.txt` is already in the repo — Streamlit Cloud reads it automatically to install `tesseract-ocr` and `poppler-utils`.
+`packages.txt` is already included — Streamlit Cloud reads it to auto-install `tesseract-ocr` and `poppler-utils`.
 
----
-
-## File Structure
-
-```
-reconcile-app/
-├── app.py              # Streamlit UI
-├── reconciler.py       # Extraction + matching engine (no UI dependency)
-├── requirements.txt    # Python dependencies
-├── packages.txt        # System dependencies (Streamlit Cloud)
-└── README.md
-```
-
-`reconciler.py` has zero UI dependency — import it standalone for headless use:
+### Use reconciler.py standalone (headless / no UI)
 
 ```python
 from reconciler import extract_from_pdf, extract_from_csv, reconcile, to_excel
@@ -82,36 +209,18 @@ with open("report.xlsx", "wb") as f:
     f.write(to_excel(result))
 ```
 
----
+### File Structure
 
-## Books CSV Format (Tally)
+```
+reconciliation.com/
+├── app.py              # Streamlit UI
+├── reconciler.py       # Extraction + matching engine (no UI dependency)
+├── requirements.txt    # Python dependencies
+├── packages.txt        # System dependencies (Streamlit Cloud)
+└── README.md
+```
 
-Export from TallyPrime:
-> Gateway of Tally → Display → Account Books → Ledger → Export → **Excel / CSV**
-
-Required columns (case-insensitive):
-
-| Column | Accepted names |
-|---|---|
-| Date | `date` |
-| Narration | `narration`, `description`, `particulars`, `remarks` |
-| Debit | `debit`, `dr`, `withdrawal` |
-| Credit | `credit`, `cr`, `deposit` |
-
----
-
-## Custom Column Mapper
-
-If your bank isn't in the supported list or Auto-Detect fails:
-
-1. Select **Custom** from the Bank Format dropdown
-2. A raw table preview of your PDF appears
-3. Use the 4 dropdowns to map **Date / Narration / Debit / Credit** to the correct column
-4. Run reconciliation
-
----
-
-## Matching Logic
+### Matching Logic
 
 Runs in 4 sequential passes on remaining unmatched entries:
 
@@ -122,24 +231,18 @@ Pass 3 — Consolidated N:1 N bank entries = one book entry
 Pass 4 — Reversals        Debit + Credit of same amount within date window
 ```
 
----
-
-## Settings
-
-| Setting | Default | Notes |
-|---|---|---|
-| Amount Tolerance | ₹0.01 | Allows minor rounding differences |
-| Narration Match % | 60 | Fuzzy match threshold — lower for UPI/NEFT codes |
-| Date Tolerance | 2 days | Allows entries recorded on different days to match |
-
----
-
-## ⚠️ Privacy
-
-Files are processed **in-memory** and never stored to disk. However, when hosted on Streamlit Community Cloud, data passes through Streamlit's US servers. For sensitive client data (CA/tax use), **run locally**.
-
----
-
-## Tech Stack
+### Tech Stack
 
 `streamlit` · `pdfplumber` · `rapidfuzz` · `scipy` · `pandas` · `pikepdf` · `pytesseract` · `pdf2image` · `python-dateutil`
+
+---
+
+## 🤝 Contributing
+
+Pull requests are welcome. For major changes, open an issue first to discuss what you'd like to change.
+
+---
+
+## ⭐ If this helped you
+
+Give the repo a star — it helps others find this tool.
